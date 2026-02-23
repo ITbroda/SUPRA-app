@@ -30,10 +30,10 @@ st.markdown("""
 def get_db_connection():
     try:
         return mysql.connector.connect(
-            host=st.secrets.get("DB_HOST", "34.95.174.44"),
-            user=st.secrets.get("DB_USER", "broda"),
-            password=st.secrets.get("DB_PASS", "0CGb41lxt3UE"),
-            database=st.secrets.get("DB_NAME", "AppSupra-Recetario")
+            host=st.secrets["DB_HOST"],
+            user=st.secrets["DB_USER"],
+            password=st.secrets["DB_PASS"],
+            database=st.secrets["DB_NAME"]
         )
     except Exception as e:
         st.error(f"Error de conexión: {e}")
@@ -44,36 +44,38 @@ def recalcular_costos_cascada():
     if not conn: return
     cursor = conn.cursor()
     try:
-        # 1. Actualizamos Componentes
+        # 1. Actualización de Componentes
         cursor.execute("""
-            UPDATE componentes_maestro cm
+            UPDATE componentes_maestro 
             SET costo_total_calculado = (
                 SELECT COALESCE(SUM(d.cantidad_bruta * i.costo_unitario), 0)
                 FROM componentes_detalle d
                 JOIN ingredientes_supra i ON d.codigo_hijo = i.codigo_ingrediente
-                WHERE d.codigo_padre = cm.codigo_componente
+                WHERE d.codigo_padre = codigo_componente
             )
+            WHERE codigo_componente IS NOT NULL
         """)
-        # 2. Actualizamos Platos (Costo y Peso si es 0)
+        # 2. Actualización de Platos (Costo y Peso)
         cursor.execute("""
-            UPDATE platos_maestro pm
+            UPDATE platos_maestro 
             SET 
                 costo_total_calculado = (
                     SELECT COALESCE(SUM(d.cantidad_inicial * COALESCE(i.costo_unitario, c.costo_total_calculado, 0)), 0)
                     FROM platos_detalle d
                     LEFT JOIN ingredientes_supra i ON d.codigo_hijo = i.codigo_ingrediente
                     LEFT JOIN componentes_maestro c ON d.codigo_hijo = c.codigo_componente
-                    WHERE d.codigo_plato_padre = pm.codigo_plato_supra
+                    WHERE d.codigo_plato_padre = codigo_plato_supra
                 ),
-                peso_total_gramos = CASE 
-                    WHEN peso_total_gramos IS NULL OR peso_total_gramos = 0 THEN 
-                        (SELECT COALESCE(SUM(cantidad_inicial), 0) FROM platos_detalle WHERE codigo_plato_padre = pm.codigo_plato_supra)
-                    ELSE peso_total_gramos 
-                END
+                peso_total_gramos = (
+                    SELECT COALESCE(NULLIF(SUM(cantidad_inicial), 0), 1) 
+                    FROM platos_detalle 
+                    WHERE codigo_plato_padre = codigo_plato_supra
+                )
+            WHERE codigo_plato_supra IS NOT NULL
         """)
         conn.commit()
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error en cascada: {e}")
     finally:
         conn.close()
 
@@ -97,7 +99,6 @@ def get_next_code(prefix, tabla, columna):
         return f"{prefix}001"
 
 def get_item_cost(codigo):
-    """Mejorada para leer desde la columna calculada si es Serie 20"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -107,7 +108,6 @@ def get_item_cost(codigo):
             res = cursor.fetchone()
             return float(res[0]) if res else 0.0
         elif codigo_str.startswith('2'): 
-            # Lee directamente el costo calculado para no hacer mil queries por segundo
             cursor.execute("SELECT costo_total_calculado FROM componentes_maestro WHERE codigo_componente = %s", (codigo,))
             res = cursor.fetchone()
             return float(res[0]) if res and res[0] else 0.0
@@ -121,12 +121,10 @@ st.sidebar.title("SUPRA Planta")
 menu = st.sidebar.radio("GESTIÓN PRINCIPAL", ["📊 Dashboard", "📦 Insumos (30...)", "🍳 Componentes (20...)", "🍽️ Platos Finales (10...)"])
 
 # --- MODULO 0: DASHBOARD ---
-# --- MODULO 0: DASHBOARD ---
 if menu == "📊 Dashboard":
     st.header("Dashboard de Gestión de Recetario")
     conn = get_db_connection()
     if conn:
-        # Métricas rápidas
         c_i = pd.read_sql("SELECT COUNT(*) as t FROM ingredientes_supra", conn).iloc[0]['t']
         c_p = pd.read_sql("SELECT COUNT(*) as t FROM platos_maestro", conn).iloc[0]['t']
         
@@ -135,13 +133,13 @@ if menu == "📊 Dashboard":
         k2.metric("Platos Finales (10)", c_p)
         with k3:
             if st.button("🔄 RECALCULAR TODO"):
-                recalcular_costos_cascada()
+                with st.spinner("Sincronizando costos..."):
+                    recalcular_costos_cascada()
                 st.rerun()
         
         st.divider()
         st.subheader("Catálogo con Costos en Tiempo Real")
         
-        # SQL con NULLIF para evitar errores de división por cero
         df_d = pd.read_sql("""
             SELECT 
                 codigo_plato_supra as 'Código', 
@@ -153,7 +151,6 @@ if menu == "📊 Dashboard":
             ORDER BY codigo_plato_supra DESC
         """, conn)
         
-        # Formateo con separador de miles para números grandes
         st.dataframe(df_d.style.format({
             'Costo Total ($)': '{:,.2f}',
             'Costo x KG ($)': '{:,.2f}',
@@ -168,10 +165,16 @@ elif menu == "📦 Insumos (30...)":
     with col_f1:
         with st.expander("➕ Cargar Nuevo Ingrediente Individual"):
             with st.form("new_ing"):
+                conn = get_db_connection()
+                # Nuevo selector basado en la tabla estructurada
+                df_cls = pd.read_sql("SELECT codigo, tipo, sub_division FROM clasificacion_supra WHERE id_gran_familia = 3", conn)
+                conn.close()
+                
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    fam = st.selectbox("Familia/Grupo", ["30101 - Almacen", "30401 - Verduras", "31101 - Carnes"])
-                    pre = fam.split(" - ")[0]
+                    ops_ins = df_cls.apply(lambda x: f"{x['codigo']} - {x['tipo']} ({x['sub_division']})", axis=1).tolist()
+                    fam_sel = st.selectbox("Categoría Insumo", ops_ins)
+                    pre = fam_sel.split(" - ")[0]
                     desc = st.text_input("Nombre Insumo")
                 with c2:
                     um = st.selectbox("UM", ["KG", "LT", "UN", "GR"])
@@ -186,13 +189,12 @@ elif menu == "📦 Insumos (30...)":
                     u_c = cost_e / cant_e if cant_e > 0 else 0
                     cursor.execute("INSERT INTO ingredientes_supra (codigo_ingrediente, descripcion, um, cantidad_envase, costo_total_envase, costo_unitario, proveedor) VALUES (%s,%s,%s,%s,%s,%s,%s)", (nuevo_id, desc, um, cant_e, cost_e, u_c, prov))
                     conn.commit()
-                    # DISPARO CASCADA
                     recalcular_costos_cascada()
                     conn.close(); st.success(f"Guardado como {nuevo_id}"); st.rerun()
 
     with col_f2:
         with st.expander("📥 Importación Masiva (Subir Excel)"):
-            st.write("Subí tu archivo editado. Si ponés el código de familia (ej: 30401), el sistema generará el código final automáticamente.")
+            st.write("Subí tu archivo editado con los códigos de 5 dígitos (ej: 30401).")
             archivo_subido = st.file_uploader("Elegir archivo .xlsx", type=['xlsx'])
             
             if archivo_subido and st.button("🚀 INICIAR IMPORTACIÓN"):
@@ -215,11 +217,10 @@ elif menu == "📦 Insumos (30...)":
                         else:
                             final_id = cod_clean
                             actualizados += 1
-                        try:
-                            c_total = float(row.get('costo_total_envase', 0))
-                            c_cant = float(row.get('cantidad_envase', 1))
-                            u_cost = c_total / c_cant if c_cant > 0 else 0
-                        except: c_total, c_cant, u_cost = 0, 1, 0
+                        
+                        c_total = float(row.get('costo_total_envase', 0))
+                        c_cant = float(row.get('cantidad_envase', 1))
+                        u_cost = c_total / c_cant if c_cant > 0 else 0
                         
                         sql = """INSERT INTO ingredientes_supra (codigo_ingrediente, descripcion, costo_total_envase, cantidad_envase, costo_unitario, proveedor)
                                  VALUES (%s, %s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE 
@@ -228,12 +229,11 @@ elif menu == "📦 Insumos (30...)":
                         cursor.execute(sql, (final_id, str(row['descripcion']).upper().strip(), c_total, c_cant, u_cost, str(row.get('proveedor', '')).strip()))
                     
                     conn.commit()
-                    # DISPARO CASCADA
                     recalcular_costos_cascada()
                     conn.close()
-                    st.success(f"✅ ¡Éxito! Se cargaron {nuevos} nuevos y se actualizaron {actualizados} existentes.")
+                    st.success(f"✅ ¡Éxito! {nuevos} nuevos y {actualizados} actualizados.")
                     st.rerun()
-                except Exception as e: st.error(f"❌ Error crítico: {e}")
+                except Exception as e: st.error(f"❌ Error: {e}")
 
     st.divider()
     conn = get_db_connection()
@@ -249,9 +249,8 @@ elif menu == "📦 Insumos (30...)":
                 new_u = float(r['costo_total_envase']) / float(r['cantidad_envase']) if float(r['cantidad_envase']) > 0 else 0
                 cursor.execute("UPDATE ingredientes_supra SET descripcion=%s, costo_total_envase=%s, cantidad_envase=%s, costo_unitario=%s, proveedor=%s WHERE codigo_ingrediente=%s", (r['descripcion'], r['costo_total_envase'], r['cantidad_envase'], new_u, r['proveedor'], r['codigo_ingrediente']))
             conn.commit()
-            # DISPARO CASCADA
             recalcular_costos_cascada()
-            conn.close(); st.success("Sincronizado y recalculado"); st.rerun()
+            conn.close(); st.success("Sincronizado"); st.rerun()
     with c_btn2:
         excel_ins = descargar_excel(df_l)
         st.download_button("📥 Exportar Insumos (Excel)", data=excel_ins, file_name="insumos_supra.xlsx")
@@ -261,12 +260,15 @@ elif menu == "🍳 Componentes (20...)":
     st.header("Elaboración de Componentes")
     with st.expander("➕ Crear Nuevo Componente"):
         if 'rows_c' not in st.session_state: st.session_state.rows_c = []
+        conn = get_db_connection()
+        df_cls_c = pd.read_sql("SELECT codigo, tipo, sub_division FROM clasificacion_supra WHERE id_gran_familia = 2", conn)
+        
         c1, c2 = st.columns(2)
         nom_c = c1.text_input("Nombre de la Sub-receta")
-        fam_c = c1.selectbox("Familia", ["20101 - Principal", "20401 - Salsas"])
+        ops_comp = df_cls_c.apply(lambda x: f"{x['codigo']} - {x['tipo']} ({x['sub_division']})", axis=1).tolist()
+        fam_c = c1.selectbox("Familia Componente", ops_comp)
         tot_c_placeholder = c2.empty()
 
-        conn = get_db_connection()
         df_i = pd.read_sql("SELECT codigo_ingrediente as id, descripcion as n FROM ingredientes_supra", conn); conn.close()
         ops_c = df_i.apply(lambda x: f"{x['id']} - {x['n']}", axis=1).tolist()
 
@@ -293,7 +295,6 @@ elif menu == "🍳 Componentes (20...)":
                 if r['id']:
                     cursor.execute("INSERT INTO componentes_detalle (codigo_padre, codigo_hijo, cantidad_bruta) VALUES (%s,%s,%s)", (nc, r['id'].split(" - ")[0], r['cant']))
             conn.commit()
-            # DISPARO CASCADA
             recalcular_costos_cascada()
             conn.close(); st.success(f"Componente {nc} guardado."); st.session_state.rows_c = []; st.rerun()
 
@@ -310,13 +311,25 @@ elif menu == "🍽️ Platos Finales (10...)":
 
     if sub_tab == "✨ CREAR":
         if 'rows_p' not in st.session_state: st.session_state.rows_p = []
+        conn = get_db_connection()
+        
+        # CAMBIO CLAVE: Usamos LIKE '1%' para capturar toda la Serie 10 (Platos)
+        df_cls_p = pd.read_sql("SELECT codigo, tipo, sub_division FROM clasificacion_supra WHERE codigo_final LIKE '1%'", conn)
+        
         c1, c2 = st.columns(2)
         p_nom = c1.text_input("Nombre del Plato")
-        p_fam = c1.selectbox("Categoría", ["10101 - Carnes", "10201 - Pastas"])
+        
+        # Verificamos si hay data para el selector
+        if not df_cls_p.empty:
+            ops_plat = df_cls_p.apply(lambda x: f"{x['codigo']} - {x['tipo']} ({x['sub_division']})", axis=1).tolist()
+            p_fam = c1.selectbox("Categoría Plato", ops_plat)
+        else:
+            st.error("⚠️ No hay categorías cargadas en la tabla clasificacion_supra para Platos (Serie 10).")
+            p_fam = None
+            
         p_gr = c2.number_input("Gramaje Final (g)", value=0)
         p_tot_view = c2.empty()
 
-        conn = get_db_connection()
         q_all = "SELECT codigo_ingrediente as id, descripcion as n FROM ingredientes_supra UNION SELECT codigo_componente, nombre_receta FROM componentes_maestro"
         df_all = pd.read_sql(q_all, conn); conn.close()
         ops_p = df_all.apply(lambda x: f"{x['id']} - {x['n']}", axis=1).tolist()
@@ -335,17 +348,42 @@ elif menu == "🍽️ Platos Finales (10...)":
         p_tot_view.metric("COSTO TOTAL PLATO", f"$ {acum_p:.2f}")
 
         if st.button("💾 GUARDAR PLATO"):
-            conn = get_db_connection(); cursor = conn.cursor()
-            pre = p_fam.split(" - ")[0]
-            cid = get_next_code(pre, "platos_maestro", "codigo_plato_supra")
-            cursor.execute("INSERT INTO platos_maestro (codigo_plato_supra, nombre_plato, id_clasificacion, peso_total_gramos) VALUES (%s,%s,%s,%s)", (cid, p_nom, int(pre+"000"), p_gr))
-            for r in st.session_state.rows_p:
-                if r['id']:
-                    cursor.execute("INSERT INTO platos_detalle (codigo_plato_padre, codigo_hijo, cantidad_inicial) VALUES (%s,%s,%s)", (cid, r['id'].split(" - ")[0], r['cant']))
-            conn.commit()
-            # DISPARO CASCADA
-            recalcular_costos_cascada()
-            conn.close(); st.balloons(); st.session_state.rows_p = []; st.rerun()
+            if p_fam: # El "paracaídas" para que no tire AttributeError
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                pre = p_fam.split(" - ")[0]
+                
+                # Buscamos el id_clasificacion real
+                cursor.execute("SELECT codigo_final FROM clasificacion_supra WHERE codigo = %s LIMIT 1", (pre,))
+                res_cls = cursor.fetchone()
+                
+                if res_cls:
+                    id_clasificacion_real = res_cls[0]
+                    cid = get_next_code(pre, "platos_maestro", "codigo_plato_supra")
+                    
+                    cursor.execute("""
+                        INSERT INTO platos_maestro (codigo_plato_supra, nombre_plato, id_clasificacion, peso_total_gramos) 
+                        VALUES (%s,%s,%s,%s)
+                    """, (cid, p_nom, id_clasificacion_real, p_gr))
+                    
+                    for r in st.session_state.rows_p:
+                        if r['id']:
+                            cursor.execute("""
+                                INSERT INTO platos_detalle (codigo_plato_padre, codigo_hijo, cantidad_inicial) 
+                                VALUES (%s,%s,%s)
+                            """, (cid, r['id'].split(" - ")[0], r['cant']))
+                    
+                    conn.commit()
+                    recalcular_costos_cascada()
+                    conn.close()
+                    st.balloons()
+                    st.session_state.rows_p = []
+                    st.rerun()
+                else:
+                    st.error(f"Error: El código de familia {pre} no existe en clasificacion_supra.")
+                    conn.close()
+            else:
+                st.warning("⚠️ Seleccioná una categoría.")
 
     else:
         st.subheader("Edición Técnica de Platos")
@@ -364,10 +402,8 @@ elif menu == "🍽️ Platos Finales (10...)":
                     for _, r in ed_det.iterrows():
                         cursor.execute("UPDATE platos_detalle SET cantidad_inicial=%s WHERE id_detalle_plato=%s", (r['cantidad_inicial'], r['id_detalle_plato']))
                     conn.commit()
-                    # DISPARO CASCADA
                     recalcular_costos_cascada()
                     conn.close(); st.success("Receta actualizada"); st.rerun()
             with c_ed2:
-                excel_plat = descargar_excel(det)
-                st.download_button("📥 Descargar Ficha", data=excel_plat, file_name=f"receta_{plato_sel}.xlsx")
+                st.download_button("📥 Descargar Ficha", data=descargar_excel(det), file_name=f"receta_{plato_sel}.xlsx")
         conn.close()
